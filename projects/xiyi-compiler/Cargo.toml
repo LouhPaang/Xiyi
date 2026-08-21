@@ -3,6 +3,15 @@ name = "xiyi-compiler"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# default = ["tensor"]    # ← 注释掉
+# tensor = ["dep:tch"]    # ← 注释掉
+
 [dependencies]
 logos = "0.14"
 regex = "1.10"
+# tch = { version = "0.13", features = ["download-libtorch"], optional = true }   # ← 注释掉
+
+[[bin]]
+name = "xiyi"
+path = "src/main.rs"
