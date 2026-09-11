@@ -8,7 +8,7 @@ edition = "2024"
 # tensor = ["dep:tch"]    # ← 注释掉
 
 [dependencies]
-logos = "0.14"
+logos = "0.16"
 regex = "1.10"
 # tch = { version = "0.13", features = ["download-libtorch"], optional = true }   # ← 注释掉
 
