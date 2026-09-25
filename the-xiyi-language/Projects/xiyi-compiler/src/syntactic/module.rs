@@ -5,6 +5,7 @@ mod parse_func;
 mod parse_generic;
 mod parse_item;
 mod parse_model;
+mod parse_path;
 mod parse_pattern;
 mod parse_stmt;
 mod parse_type;

@@ -66,28 +66,10 @@ impl Parser {
     }
 
     // ===== parse_use_item =====
-    // 路径的第一段除了普通标识符，还可能是 crate/super/here 这三个路径
-    // 关键字（crate:: 当前 crate 根、super:: 父模块、here:: 当前模块）。
-    // 只有第一段会是这几个词，后续路径段（crate::iter::Iterator 里的
-    // iter、Iterator）永远是普通标识符，不用特殊处理。
-    pub(crate) fn parse_path_root(&mut self) -> Result<String, String> {
-        match self.peek() {
-            Some((Token::Crate, _)) => {
-                self.next();
-                Ok("crate".to_string())
-            }
-            Some((Token::Super, _)) => {
-                self.next();
-                Ok("super".to_string())
-            }
-            Some((Token::Here, _)) => {
-                self.next();
-                Ok("here".to_string())
-            }
-            _ => self.parse_ident(),
-        }
-    }
-
+    // 路径读取的原语（读第一段、判断/消费 ::）挪进了 parse_path.rs，
+    // 这里只保留 use 语句自己特有的部分：花括号多导入展开、别名、
+    // 结尾分号。parse_path_root() 仍然是 self 上的方法，只是定义
+    // 挪了个文件，调用方式不用变。
     pub(crate) fn parse_use_item(&mut self) -> Result<Vec<Item>, String> {
         let mut parts = Vec::new();
         let first = self.parse_path_root()?;

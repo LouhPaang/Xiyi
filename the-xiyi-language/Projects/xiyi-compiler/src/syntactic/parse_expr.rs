@@ -370,9 +370,12 @@ impl Parser {
                 }
 
                 // ===== PathSep 分支（生成 EnumVariantConstruction） =====
-                if let Some((Token::PathSep, _)) = self.peek() {
-                    self.next(); // consume '::'
-                    let variant_name = self.parse_ident()?;
+                // "peek 到 :: 就消费并读下一段"这条原语现在收在
+                // parse_path.rs 的 try_read_path_segment 里——跟
+                // parse_pattern.rs 读 Ident::Ident 限定名时用的是同一个
+                // 函数，不用各自手写一遍。
+                if let Some(result) = self.try_read_path_segment() {
+                    let variant_name = result?;
 
                     if let Some((Token::LParen, _)) = self.peek() {
                         self.next(); // consume '('
