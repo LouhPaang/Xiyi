@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use crate::ast::*;
 use crate::intrinsic::{self, CallCtx, CheckedResult, IntrinsicFn};
 use super::check_program::TypeChecker;
+use super::check_path::BareVariantOutcome;
 
 impl TypeChecker {
     pub fn check_binary_op(&self, op: &BinaryOp, left: &Type, right: &Type, left_expr: &Expr, right_expr: &Expr) -> Result<Type, String> {
@@ -131,7 +132,7 @@ impl TypeChecker {
             // 根本不是已知枚举，退一步查 self.methods（Item::Implement
             // 注册进去的函数表），当成限定路径的静态调用检查。两边都
             // 查不到才真正报错。
-            if self.methods.get(enum_name).map_or(false, |m| m.contains_key(variant_name)) {
+            if self.has_qualified_static(enum_name, variant_name) {
                 return self.check_qualified_static_call(enum_name, variant_name, args, expected);
             }
             return Err(format!("undefined enum: {}", enum_name));
@@ -206,11 +207,7 @@ impl TypeChecker {
         fields: &[(String, Expr)],
         expected: Option<&Type>,
     ) -> Result<Type, String> {
-        let struct_def = self
-            .structs
-            .get(struct_name)
-            .ok_or_else(|| format!("undefined struct: {}", struct_name))?
-            .clone();
+        let struct_def = self.resolve_struct(struct_name)?;
         if fields.len() != struct_def.fields.len() {
             return Err(format!(
                 "struct {} expects {} fields, got {}",
@@ -329,18 +326,6 @@ impl TypeChecker {
         }
     }
 
-    // ===== 辅助：哪些已注册的枚举里有一个恰好叫这个名字的变体 =====
-    // 从 check_expr 和 check_expr_with_expected 两处几乎一模一样的
-    // "在 self.enums 里找变体名匹配"逻辑抽出来——原来两处各自写一遍，
-    // 改一次筛选逻辑（比如以后要排除某种特殊枚举）得同时改两个地方。
-    fn find_enums_with_variant(&self, variant_name: &str) -> Vec<String> {
-        self.enums
-            .iter()
-            .filter(|(_, e)| e.variants.iter().any(|v| v.name == variant_name))
-            .map(|(name, _)| name.clone())
-            .collect()
-    }
-
     // ===== check_expr 的"带期望类型提示"版本 =====
     //
     // 目前只在 EnumVariantConstruction / StructInit 这两个会产生尚未绑定
@@ -362,16 +347,13 @@ impl TypeChecker {
             // Result<Rational, E> 里的 E）就留在没绑定的状态，跟声明的
             // 返回类型（比如 Result<Rational, ()>）对不上。
             (ExprKind::Call { qualifier: None, func, args, is_method: false }, Some(expected_ty)) => {
-                let bare_matches: Vec<String> = self
-                    .enums
-                    .iter()
-                    .filter(|(_, e)| e.variants.iter().any(|v| v.name == *func))
-                    .map(|(name, _)| name.clone())
-                    .collect();
-                if bare_matches.len() == 1 {
-                    self.check_enum_variant_construction(&bare_matches[0], func, args, Some(expected_ty))
-                } else {
-                    self.check_expr(expr)
+                match self.resolve_bare_variant(func) {
+                    BareVariantOutcome::Unique(enum_name) => {
+                        self.check_enum_variant_construction(&enum_name, func, args, Some(expected_ty))
+                    }
+                    BareVariantOutcome::Ambiguous(_) | BareVariantOutcome::NotFound => {
+                        self.check_expr(expr)
+                    }
                 }
             }
             // 关键新增：裸整数字面量直接迁就期望类型。之前字面量的类型
@@ -662,16 +644,19 @@ impl TypeChecker {
                 // 名字被多个枚举用作变体名时（真撞了）就报错让用户写限定
                 // 路径消歧义，不去猜。
                 if !is_method {
-                    let matches = self.find_enums_with_variant(func);
-                    if matches.len() == 1 {
-                        return self.check_enum_variant_construction(&matches[0], func, args, None);
-                    } else if matches.len() > 1 {
-                        return Err(format!(
-                            "ambiguous bare variant `{}`: matches multiple enums ({}), use a qualified path like EnumName::{}(...)",
-                            func,
-                            matches.join(", "),
-                            func
-                        ));
+                    match self.resolve_bare_variant(func) {
+                        BareVariantOutcome::Unique(enum_name) => {
+                            return self.check_enum_variant_construction(&enum_name, func, args, None);
+                        }
+                        BareVariantOutcome::Ambiguous(candidates) => {
+                            return Err(format!(
+                                "ambiguous bare variant `{}`: matches multiple enums ({}), use a qualified path like EnumName::{}(...)",
+                                func,
+                                candidates.join(", "),
+                                func
+                            ));
+                        }
+                        BareVariantOutcome::NotFound => {}
                     }
                 }
 
@@ -803,10 +788,7 @@ impl TypeChecker {
                 let stripped_ty = self.strip_privacy(&struct_ty);
                 match stripped_ty {
                     Type::Struct(name) => {
-                        let struct_def = self
-                            .structs
-                            .get(&name)
-                            .ok_or_else(|| format!("undefined struct: {}", name))?;
+                        let struct_def = self.resolve_struct(&name)?;
                         for field in &struct_def.fields {
                             if field.name == *field_name {
                                 return Ok(self.strip_privacy(&field.ty));
@@ -825,11 +807,7 @@ impl TypeChecker {
                     // 保证以后要是有字段类型直接引用 T（比如 ptr: *mut T），
                     // 取出来的类型也是正确替换过的，不是裸的 TypeParam。
                     Type::Generic(name, type_args) => {
-                        let struct_def = self
-                            .structs
-                            .get(&name)
-                            .cloned()
-                            .ok_or_else(|| format!("undefined struct: {}", name))?;
+                        let struct_def = self.resolve_struct(&name)?;
                         let param_names: Vec<String> = struct_def
                             .generic_params
                             .iter()
@@ -989,11 +967,10 @@ impl TypeChecker {
                 Ok(Type::ConstIntArray(values))
             }
             ExprKind::EnumVariantAccess { enum_name, variant_name } => {
-                let enum_def = self
-                    .enums
-                    .get(enum_name)
-                    .ok_or_else(|| format!("undefined enum: {}", enum_name))?;
-                if !enum_def.variants.iter().any(|v| v.name == *variant_name) {
+                if !self.enums.contains_key(enum_name) {
+                    return Err(format!("undefined enum: {}", enum_name));
+                }
+                if !self.has_variant(enum_name, variant_name) {
                     return Err(format!(
                         "enum {} has no variant named {}",
                         enum_name, variant_name

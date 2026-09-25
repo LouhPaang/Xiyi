@@ -22,11 +22,6 @@ impl TypeChecker {
             .ok_or_else(|| format!("undefined enum: {}", enum_name))?
             .clone();
 
-        // 预先收集变体名称
-        let variant_names: Vec<String> = enum_def.variants.iter()
-            .map(|v| v.name.clone())
-            .collect();
-
         let mut arm_types = Vec::new();
         for arm in &match_expr.arms {
             self.scopes.push(HashMap::new());
@@ -36,7 +31,7 @@ impl TypeChecker {
                     if pat_enum != &enum_name {
                         return Err("pattern enum name mismatch".to_string());
                     }
-                    if !variant_names.contains(variant_name) {
+                    if !self.has_variant(&enum_name, variant_name) {
                         return Err(format!("enum {} has no variant {}", enum_name, variant_name));
                     }
                 }
@@ -44,13 +39,11 @@ impl TypeChecker {
                     if pat_enum != &enum_name {
                         return Err("pattern enum name mismatch".to_string());
                     }
-                    if !variant_names.contains(variant_name) {
-                        return Err(format!("enum {} has no variant {}", enum_name, variant_name));
-                    }
-
-                    let variant = enum_def.variants.iter()
-                        .find(|v| v.name == *variant_name)
-                        .ok_or_else(|| "variant not found".to_string())?;
+                    // 合并原来"contains 检查 + find 取值"两次查找为一次——
+                    // 原来那次 contains 通过之后，find 必然成功，`ok_or_else(||
+                    // "variant not found")` 是永远不会走到的死代码。
+                    let variant = self.resolve_variant_in(&enum_name, variant_name)
+                        .ok_or_else(|| format!("enum {} has no variant {}", enum_name, variant_name))?;
 
                     // ===== binding_ty 推断逻辑 =====
                     // 关键修复：原来这里硬编码"泛型参数名字必须叫 T"，

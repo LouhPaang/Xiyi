@@ -98,20 +98,7 @@ impl TypeChecker {
     }
 
     fn check_param_type(&self, ty: &Type) -> Result<(), String> {
-        match ty {
-            Type::Struct(name) => {
-                if !self.structs.contains_key(name) {
-                    return Err(format!("undefined struct type: {}", name));
-                }
-            }
-            Type::Enum(name) => {
-                if !self.enums.contains_key(name) {
-                    return Err(format!("undefined enum type: {}", name));
-                }
-            }
-            _ => {}
-        }
-        Ok(())
+        self.resolve_type(ty).map(|_| ())
     }
 
     fn check_functions(&mut self, m: &ModelDef) -> Result<(), String> {

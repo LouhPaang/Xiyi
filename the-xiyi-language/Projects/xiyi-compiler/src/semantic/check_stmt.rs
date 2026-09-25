@@ -23,22 +23,7 @@ impl TypeChecker {
                 let init_type = self.check_expr_with_expected(&let_stmt.init, let_stmt.ty.as_ref())?;
 
                 let resolved_ty = if let Some(ty) = &let_stmt.ty {
-                    match ty {
-                        Type::Struct(name) => {
-                            if self.structs.contains_key(name) {
-                                Type::Struct(name.clone())
-                            } else if self.enums.contains_key(name) {
-                                Type::Enum(name.clone())
-                            } else {
-                                return Err(format!("undefined type: {}", name));
-                            }
-                        }
-                        Type::Tensor { dtype, shape } => Type::Tensor {
-                            dtype: dtype.clone(),
-                            shape: shape.clone(),
-                        },
-                        other => other.clone(),
-                    }
+                    self.resolve_type(ty)?
                 } else {
                     init_type.clone()
                 };

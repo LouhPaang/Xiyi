@@ -5,6 +5,7 @@ mod check_expr;
 mod check_func;
 mod check_generic;
 mod check_model;
+mod check_path;
 mod check_pattern;
 mod check_program;
 mod check_stmt;
