@@ -1,6 +1,5 @@
-#!/usr/bin/env bash
-# run_all_tests.sh — 希夷编译器测试套件 (Linux/macOS)
-# 对应 Windows 上的 run_all_tests.ps1
+# 希夷编译器测试套件
+# run_all_tests.sh
 #
 # 依赖:
 #   bash >= 5.3 (低于此版本直接退出), timeout (GNU coreutils / busybox; macOS 为 gtimeout), cargo
@@ -60,6 +59,14 @@ STRICT_CRASH=0
 JOBS=1
 TIMEOUT_SECONDS=30
 KEEP_LOGS=20
+NAME_REGEX_FILTERS=()
+EXCLUDE_FILTERS=()
+RERUN_FAILED=0
+RERUN_SRC=""          # --rerun-failed 读取的 JSON (在日志轮转之前选定)
+SHARD_GIVEN=0
+SHARD_SPEC=""
+SHARD_INDEX=1
+SHARD_TOTAL=1
 
 usage() {
     cat <<'EOF'
@@ -68,7 +75,14 @@ usage() {
 选项 (同时支持 --opt value 与 --opt=value):
   --expect {all|pass|fail}   只跑期望通过/期望失败的用例 (默认 all)
   --name PATTERN             匹配相对 Tests/ 的路径 (glob)，可重复
+  --name-regex PATTERN       匹配相对 Tests/ 的路径 (POSIX ERE，子串匹配，
+                             需要整串匹配时自己加 ^ $)，可重复；与 --name 是"或"的关系
+  --exclude PATTERN          排除匹配的用例 (glob)，可重复；优先级最高
   --tag TAG                  匹配 tag，可重复
+  --rerun-failed             只跑本机上一次完成的运行 (test_results/ 下最新的 .json)
+                             里失败的用例；上次全部通过则直接成功退出
+  --shard M/N                把过滤后的用例分成 N 片，只执行第 M 片 (1 <= M <= N)，
+                             用于 CI 多机并行；某一片为空时成功退出
   --skip-build               跳过 cargo build
   --release                  使用 release profile
   --fail-fast                串行模式下遇到第一个失败即停止 (并行模式忽略)
@@ -79,6 +93,14 @@ usage() {
   --timeout SECONDS          默认超时秒数，须 >= 1 (默认 30)
   --keep-logs N              只保留最近 N 次日志，须 >= 1 (默认 20)
   -h, --help                 显示本帮助
+
+过滤规则:
+  一个用例必须同时满足: --expect、(--name 或 --name-regex 任一命中)、
+  (--tag 任一命中)、--rerun-failed；被任何一条 --exclude 命中的用例一律剔除；
+  最后才按 --shard 切片。
+  --name-regex 是 POSIX ERE，不是 PCRE (没有 \d、惰性量词)；匹配用的路径统一以 / 分隔。
+  --shard 按"过滤后用例的有序位置"轮转分配：各机器必须传入完全相同的过滤参数
+  (且 Tests/ 内容一致)，各片才互不重叠、合起来恰好是完整集合。
 EOF
 }
 
@@ -91,6 +113,14 @@ die_usage() {
 is_uint() { [[ "$1" =~ ^[0-9]{1,9}$ ]]; }
 need_arg() { (( $# >= 2 )) || die_usage "选项 $1 需要一个参数"; }
 
+# join_by SEP ITEM...  (没有 ITEM 时输出空串)
+join_by() {
+    local sep="$1" out="" x
+    shift
+    for x in "$@"; do out+="${out:+$sep}$x"; done
+    printf '%s' "$out"
+}
+
 while (( $# > 0 )); do
     # --opt=value → --opt value
     if [[ "$1" == --*=* ]]; then
@@ -100,6 +130,12 @@ while (( $# > 0 )); do
         --expect)         need_arg "$@"; EXPECT="${2,,}"; shift 2;;
         --name)           need_arg "$@"; NAME_FILTERS+=("${2//\\//}"); shift 2;;   # 兼容 Windows 风格反斜杠
         --tag)            need_arg "$@"; TAG_FILTERS+=("${2,,}"); shift 2;;
+        --name-regex)     need_arg "$@"; NAME_REGEX_FILTERS+=("$2"); shift 2;;      # 正则里的反斜杠是转义，不能像 --name 那样改成 /
+        --exclude)        need_arg "$@"; EXCLUDE_FILTERS+=("${2//\\//}"); shift 2;;
+        --rerun-failed)   RERUN_FAILED=1; shift;;
+        --shard)          need_arg "$@"
+                          (( SHARD_GIVEN == 0 )) || die_usage "❌ --shard 只能指定一次"
+                          SHARD_GIVEN=1; SHARD_SPEC="$2"; shift 2;;
         --skip-build)     SKIP_BUILD=1; shift;;
         --release)        RELEASE=1; shift;;
         --fail-fast)      FAIL_FAST=1; shift;;
@@ -121,7 +157,26 @@ for _p in "${TAG_FILTERS[@]}"; do
     [[ -n "$_p" && "$_p" != *[[:space:],]* ]] \
         || die_usage "❌ --tag 的值不能为空，且不能含空白或逗号: '$_p'"
 done
-unset _p
+for _p in "${NAME_REGEX_FILTERS[@]}"; do
+    [[ -n "$_p" ]] || die_usage "❌ --name-regex 的值不能为空"
+    # 用 bash 自己的 =~ 引擎试编译 (真正匹配时用的也是它；返回 2 表示语法错误)。
+    # 不用 grep -E 验证：grep 与 bash 所用 libc 的 ERE 方言并不完全相同。
+    [[ "" =~ $_p ]]; _rc=$?
+    (( _rc != 2 )) || die_usage "❌ --name-regex 不是合法的 ERE: $_p"
+done
+for _p in "${EXCLUDE_FILTERS[@]}"; do
+    [[ -n "$_p" ]] || die_usage "❌ --exclude 的值不能为空"
+done
+unset _p _rc
+
+if (( SHARD_GIVEN == 1 )); then
+    [[ "$SHARD_SPEC" =~ ^([0-9]{1,9})/([0-9]{1,9})$ ]] \
+        || die_usage "❌ --shard 的格式应为 M/N (例如 2/4)，收到: '$SHARD_SPEC'"
+    SHARD_INDEX=$((10#${BASH_REMATCH[1]}))
+    SHARD_TOTAL=$((10#${BASH_REMATCH[2]}))
+    (( SHARD_INDEX >= 1 && SHARD_INDEX <= SHARD_TOTAL )) \
+        || die_usage "❌ --shard M/N 要求 1 <= M <= N，收到: $SHARD_INDEX/$SHARD_TOTAL"
+fi
 
 case "$EXPECT" in
     all|pass|fail) ;;
@@ -329,10 +384,25 @@ rotate_logs() {
     done
 
     for (( i = keep; i < n; i++ )); do
-        [[ "${files[i]}" == "$LOG_FILE" || "${files[i]}" == "$JSON_FILE" ]] && continue
+        [[ "${files[i]}" == "$LOG_FILE" || "${files[i]}" == "$JSON_FILE" || "${files[i]}" == "$RERUN_SRC" ]] && continue
         rm -f -- "${files[i]}"
     done
 }
+# --rerun-failed 的数据来源 = 上一次"完成"的运行留下的 JSON (被中断的运行不会产生 JSON)。
+# 必须赶在轮转之前选定并加以保护，否则 --keep-logs 1 时它会被当成旧文件清掉。
+# 只认本脚本命名规则 (YYYYMMDD_HHMMSS*.json)，不会误取别人放进来的其它 json。
+if (( RERUN_FAILED == 1 )); then
+    shopt -s nullglob
+    for _f in "$LOG_DIR"/[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9]*.json; do
+        [[ "$_f" == "$JSON_FILE" ]] && continue
+        if [[ -z "$RERUN_SRC" ]] || older_than "$RERUN_SRC" "$_f"; then
+            RERUN_SRC="$_f"
+        fi
+    done
+    shopt -u nullglob
+    unset _f
+fi
+
 rotate_logs log  "$KEEP_LOGS"            # 本次 .log 已创建，含在 KEEP_LOGS 之内
 rotate_logs json "$(( KEEP_LOGS - 1 ))"  # 本次 .json 在最后才写，先给它留一个位置
 
@@ -390,7 +460,9 @@ find_xiyi_exe() {
 echo "${C_CYAN}========================================${C_RESET}"
 echo "${C_CYAN} 希夷编译器测试套件${C_RESET}"
 echo "${C_CYAN} xiyi-compiler 版本: $XIYI_VERSION${C_RESET}"
-echo "${C_CYAN} Expect 过滤: $EXPECT   并发: $JOBS   超时(默认): ${TIMEOUT_SECONDS}s${C_RESET}"
+_shard_info=""
+(( SHARD_GIVEN == 1 )) && _shard_info="   分片: $SHARD_INDEX/$SHARD_TOTAL"
+echo "${C_CYAN} Expect 过滤: $EXPECT   并发: $JOBS   超时(默认): ${TIMEOUT_SECONDS}s${_shard_info}${C_RESET}"
 echo "${C_GRAY} 编译器目录: $COMPILER_ROOT${C_RESET}"
 echo "${C_GRAY} 标准库目录: $STDLIB${C_RESET}"
 echo "${C_GRAY} 测试目录:   $TEST_DIR${C_RESET}"
@@ -402,6 +474,7 @@ echo
     echo "运行 ID: $RUN_ID"
     echo "版本: $XIYI_VERSION"
     echo "参数: Expect=$EXPECT Jobs=$JOBS SkipBuild=$SKIP_BUILD Release=$RELEASE UpdateGoldens=$UPDATE_GOLDENS FailFast=$FAIL_FAST StrictCrash=$STRICT_CRASH"
+    echo "过滤: name=[$(join_by '; ' "${NAME_FILTERS[@]}")] name-regex=[$(join_by '; ' "${NAME_REGEX_FILTERS[@]}")] exclude=[$(join_by '; ' "${EXCLUDE_FILTERS[@]}")] tag=[$(join_by '; ' "${TAG_FILTERS[@]}")] rerun-failed=$RERUN_FAILED shard=${SHARD_SPEC:-无}"
 } >> "$LOG_FILE"
 
 # ============================================================
@@ -645,43 +718,115 @@ for key in "${!OV_SEEN[@]}"; do
 done
 
 # ---- 过滤 ----
+# 一个用例要被选中，必须"同时"满足下面几条 (AND)：
+#   1. --expect                 期望结果相符
+#   2. --name / --name-regex    两者合起来任一命中即可 (OR)；都没给就不限制
+#   3. --tag                    任一命中即可 (OR)；没给就不限制
+#   4. --rerun-failed           在上一次完成的运行里是 FAIL
+# 满足以上之后，只要被任何一条 --exclude 命中就剔除 (优先级最高)。
+# 最后才按 --shard 切片：切片永远作用在"已经过滤完"的有序列表上。
+declare -A FAILED_SET=()
+
+# 读取上一次完成的运行里失败的用例，填充 FAILED_SET
+load_rerun_set() {
+    command -v jq >/dev/null 2>&1 || fatal "--rerun-failed 需要 jq 来读取上一次的 JSON 结果"
+    [[ -n "$RERUN_SRC" ]] \
+        || fatal "--rerun-failed: $LOG_DIR 下没有任何历史 JSON 结果，请先完整跑一次"
+
+    local src_name="${RERUN_SRC##*/}" check p nfail=0
+
+    # 先确认这确实是本脚本产出的结果文件。损坏或格式不对时要明说，
+    # 不能让它悄悄表现成"没有失败的用例"。
+    if ! check="$(jq -e '(.Results | type) == "array"' "$RERUN_SRC" 2>&1)"; then
+        [[ "$check" == "false" ]] && check="缺少 Results 数组"
+        fatal "--rerun-failed: 无法读取 $src_name: ${check%%$'\n'*}"
+    fi
+
+    while IFS= read -r p; do
+        [[ -n "$p" ]] || continue
+        FAILED_SET["$p"]=1
+        nfail=$(( nfail + 1 ))
+        # 用例被改名或删除后，旧记录对不上任何文件：提醒一声，而不是静默丢掉
+        [[ -n "${REL_SET["$p"]+x}" ]] || warn "上次失败的用例已不存在，将被忽略: $p"
+    done < <(jq -r '.Results[] | select(.Status == "FAIL") | .RelPath // empty' "$RERUN_SRC")
+
+    if (( nfail == 0 )); then
+        # 上次全绿不是错误："先跑一遍、再重跑失败项"的用法里，这应当算成功
+        echo "${C_GREEN}✅ $src_name 里没有失败的用例，无需重跑${C_RESET}"
+        echo "--rerun-failed: $src_name 中没有失败用例，未执行任何测试" >> "$LOG_FILE"
+        exit 0
+    fi
+    echo "${C_GRAY}[rerun-failed] 从 $src_name 载入 $nfail 个失败用例${C_RESET}"
+}
+(( RERUN_FAILED == 1 )) && load_rerun_set
+
 for i in "${!T_REL[@]}"; do
+    rel="${T_REL[$i]}"
+
     if [[ "$EXPECT" != "all" ]]; then
         want="PASS"
         [[ "$EXPECT" == "fail" ]] && want="FAIL"
-        [[ "${T_EXPECT[$i]}" != "$want" ]] && continue
+        [[ "${T_EXPECT[$i]}" == "$want" ]] || continue
     fi
 
-    if (( ${#NAME_FILTERS[@]} > 0 )); then
+    if (( ${#NAME_FILTERS[@]} + ${#NAME_REGEX_FILTERS[@]} > 0 )); then
         matched=0
         for pat in "${NAME_FILTERS[@]}"; do
-            # pat 故意不加引号，让 glob 生效
+            # pat 故意不加引号：要让 glob 生效
             # shellcheck disable=SC2053
-            if [[ "${T_REL[$i]}" == $pat ]]; then
-                matched=1
-                break
-            fi
+            if [[ "$rel" == $pat ]]; then matched=1; break; fi
         done
-        (( matched == 0 )) && continue
+        if (( matched == 0 )); then
+            for rx in "${NAME_REGEX_FILTERS[@]}"; do
+                # 正则在参数校验阶段已经试编译过，这里不会再遇到语法错误
+                if [[ "$rel" =~ $rx ]]; then matched=1; break; fi
+            done
+        fi
+        (( matched == 1 )) || continue
     fi
 
     if (( ${#TAG_FILTERS[@]} > 0 )); then
         matched=0
         tags_sp=" ${T_TAGS[$i],,} "
         for want in "${TAG_FILTERS[@]}"; do
-            if [[ "$tags_sp" == *" $want "* ]]; then
-                matched=1
-                break
-            fi
+            if [[ "$tags_sp" == *" $want "* ]]; then matched=1; break; fi
         done
-        (( matched == 0 )) && continue
+        (( matched == 1 )) || continue
+    fi
+
+    if (( RERUN_FAILED == 1 )) && [[ -z "${FAILED_SET["$rel"]+x}" ]]; then
+        continue
+    fi
+
+    if (( ${#EXCLUDE_FILTERS[@]} > 0 )); then
+        excluded=0
+        for pat in "${EXCLUDE_FILTERS[@]}"; do
+            # shellcheck disable=SC2053
+            if [[ "$rel" == $pat ]]; then excluded=1; break; fi
+        done
+        (( excluded == 0 )) || continue
     fi
 
     FILTERED+=("$i")
 done
 
-if (( ${#FILTERED[@]} == 0 )); then
-    fatal "过滤后没有匹配的测试用例"
+(( ${#FILTERED[@]} > 0 )) || fatal "过滤后没有匹配的测试用例"
+
+# ---- 分片 ----
+# FILTERED 的顺序 = T_REL 的顺序 = 扫描时按 C 区域设置字典序排好的相对路径，
+# 与机器、locale 无关，所以各分片的划分彼此一致。按位置轮转 (而非按目录切块)，
+# 可以把相邻的、通常耗时相近的用例打散到不同分片，负载更均衡。
+if (( SHARD_GIVEN == 1 )); then
+    shard_before=${#FILTERED[@]}
+    declare -a shard_picked=()
+    for pos in "${!FILTERED[@]}"; do
+        if (( pos % SHARD_TOTAL == SHARD_INDEX - 1 )); then
+            shard_picked+=("${FILTERED[pos]}")
+        fi
+    done
+    FILTERED=("${shard_picked[@]}")
+    # N 大于用例数时，后面的分片会是空的——这不是错误 (见文末)
+    echo "${C_GRAY}[shard $SHARD_INDEX/$SHARD_TOTAL] 过滤后共 $shard_before 个用例，本片 ${#FILTERED[@]} 个${C_RESET}"
 fi
 
 echo "共 ${#FILTERED[@]} 个测试用例（目录下总计发现 ${#T_REL[@]} 个）"
@@ -1089,6 +1234,13 @@ printf '汇总: 总计 %d, 通过 %d, 失败 %d, 超时 %d, 跳过 %d, 已更新
 if (( failed > 0 )); then
     echo "${C_RED}❌ 有 $failed 个测试失败${C_RESET}"
     exit 1
+fi
+
+if (( total == 0 )); then
+    # 走到这里只可能是分片为空 (过滤结果为空已在前面 fatal)。
+    # CI 里 N 大于用例数时，多出来的分片应当成功，而不是无故变红。
+    echo "${C_YELLOW}ℹ️  本次没有分到任何用例 (分片 $SHARD_INDEX/$SHARD_TOTAL 为空)，视为成功${C_RESET}"
+    exit 0
 fi
 
 if (( UPDATE_GOLDENS == 1 )); then

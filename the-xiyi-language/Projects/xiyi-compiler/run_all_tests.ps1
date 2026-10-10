@@ -1,5 +1,5 @@
-﻿# run_all_tests.ps1 — 希夷编译器测试套件 (Windows)
-# 对应 Linux/macOS 上的 run_all_tests.sh
+﻿# 希夷编译器测试套件
+# run_all_tests.ps1
 #
 # 要求:
 #   - 64 位 Windows + 64 位 PowerShell，PowerShell >= 7.6.6 (低于此版本直接退出)
