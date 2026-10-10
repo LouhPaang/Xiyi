@@ -128,10 +128,10 @@ while (( $# > 0 )); do
     fi
     case "$1" in
         --expect)         need_arg "$@"; EXPECT="${2,,}"; shift 2;;
-        --name)           need_arg "$@"; NAME_FILTERS+=("${2//\\//}"); shift 2;;   # 兼容 Windows 风格反斜杠
+        --name)           need_arg "$@"; NAME_FILTERS+=("$2"); shift 2;;
         --tag)            need_arg "$@"; TAG_FILTERS+=("${2,,}"); shift 2;;
-        --name-regex)     need_arg "$@"; NAME_REGEX_FILTERS+=("$2"); shift 2;;      # 正则里的反斜杠是转义，不能像 --name 那样改成 /
-        --exclude)        need_arg "$@"; EXCLUDE_FILTERS+=("${2//\\//}"); shift 2;;
+        --name-regex)     need_arg "$@"; NAME_REGEX_FILTERS+=("$2"); shift 2;;
+        --exclude)        need_arg "$@"; EXCLUDE_FILTERS+=("$2"); shift 2;;
         --rerun-failed)   RERUN_FAILED=1; shift;;
         --shard)          need_arg "$@"
                           (( SHARD_GIVEN == 0 )) || die_usage "❌ --shard 只能指定一次"

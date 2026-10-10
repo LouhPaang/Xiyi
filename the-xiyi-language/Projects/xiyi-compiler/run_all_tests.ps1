@@ -12,7 +12,14 @@
 #   (PowerShell 版本检查不可跳过)。
 #
 # 与 run_all_tests.sh 的语义保持基本一致 (参数、过滤、golden、超时、JSON 字段)。
+#
+# 多值参数 (-Name -NameRegex -Exclude -Tag) 的写法 —— 与 sh 版的"重复 --name"不同，这是 PowerShell 的限制:
+#   在 PowerShell 会话里，或用 pwsh -Command:   -Name 'lexer/*','parser/*'
+#   用 pwsh -File 时，逗号不会被拆分、同名参数也不能重复，每个选项只能给一个值。
+#   这时想"匹配多个路径"请改用 -NameRegex '^(lexer|parser)/'；-Tag 例外 (见下)，两种方式下 -Tag a,b 都可用。
 # .exit golden 两边都只接受 0-255 (POSIX 退出码范围)，保证仓库里共享的 golden 在两个平台含义一致。
+# 退出码: 0 成功 (含"空分片"与"上次没有失败"); 1 有用例失败或运行期致命错误; 2 脚本自己检出的参数错误
+#         (参数绑定阶段由 PowerShell 自身拦截的错误，如 -Jobs 0，退出码是 1，这是 PowerShell 的行为)。
 # 平台细节差异: sh 以"信号 / 退出码 > 128"识别崩溃，这里以 NTSTATUS 错误码
 # (0xC0000000-0xC000FFFF，如访问违例、栈溢出) 识别；超时由 WaitForExit 直接判定，
 # 不依赖退出码。
@@ -24,13 +31,32 @@ param(
     [ValidateSet('all', 'pass', 'fail')]
     [string]$Expect = 'all',
 
-    # 支持通配，如 *loop*，匹配相对 Tests/ 的路径 (正反斜杠均可)
-    [ValidateScript({ if ($_ -and $_.Trim()) { $true } else { throw '-Name 的值不能为空' } })]
+    # 匹配相对 Tests/ 的路径 (PowerShell -like 通配符)，可给多个值；正反斜杠均可。
+    # 通配符里的转义符是反引号 `，不是反斜杠 (sh 版 glob 用反斜杠转义)。
+    [ValidateScript({ if (-not [string]::IsNullOrEmpty($_)) { $true } else { throw '-Name 的值不能为空' } })]
     [string[]]$Name,
 
-    # 匹配源码头 // @tag a, b 或 list.json 里的 tag
-    [ValidateScript({ if ($_ -match '^[^\s,]+$') { $true } else { throw "-Tag 的值不能为空，且不能含空白或逗号: '$_'" } })]
+    # 匹配相对 Tests/ 的路径 (.NET 正则，子串匹配，需整串匹配请自己加 ^$)，
+    # 可重复；与 -Name 是"或"的关系。区分大小写。
+    [ValidateScript({ if (-not [string]::IsNullOrEmpty($_)) { $true } else { throw '-NameRegex 的值不能为空' } })]
+    [string[]]$NameRegex,
+
+    # 排除匹配的用例 (-like 通配符)，可给多个值；优先级最高。区分大小写。
+    [ValidateScript({ if (-not [string]::IsNullOrEmpty($_)) { $true } else { throw '-Exclude 的值不能为空' } })]
+    [string[]]$Exclude,
+
+    # 匹配源码头 // @tag a, b 或 list.json 里的 tag (大小写不敏感)。
+    # 唯一例外地支持逗号分隔 (-Tag a,b)：tag 本身不含逗号，拆分没有歧义，pwsh -File 也能传多个 tag。
+    [ValidateScript({ if ($_ -match '^[^\s,]+(,[^\s,]+)*\z') { $true } else { throw "-Tag 的值不能为空、不能含空白，逗号只能用来分隔多个 tag: '$_'" } })]
     [string[]]$Tag,
+
+    # 只跑本机上一次完成的运行 (test_results/ 下最新的 YYYYMMDD_HHMMSS*.json)
+    # 里失败的用例；上次全部通过则直接成功退出
+    [switch]$RerunFailed,
+
+    # "M/N": 把过滤后的用例分成 N 片，只执行第 M 片 (1 <= M <= N)，用于 CI 多机并行；
+    # 某一片为空时成功退出
+    [string]$Shard,
 
     [switch]$SkipBuild,
     [switch]$Release,
@@ -84,17 +110,90 @@ if (($env:CI -or $env:NO_COLOR) -and $PSStyle) {
     $PSStyle.OutputRendering = 'PlainText'
 }
 
-if ($Name) { $Name = @($Name | ForEach-Object { $_ -replace '\\', '/' }) }   # 兼容 Windows 风格反斜杠
-
 function Exit-WithError {
     param([string]$Message)
     Write-Host "❌ $Message" -ForegroundColor Red
     exit 1
 }
 
+# 参数用法错误：退出码 2，与 sh 版一致，方便 CI 把"用法错误"和"测试失败"区分开
+function Exit-WithUsage {
+    param([string]$Message)
+    Write-Host "❌ $Message" -ForegroundColor Red
+    exit 2
+}
+
 function Write-Warn {
     param([string]$Message)
     Write-Host "⚠️  $Message" -ForegroundColor Yellow
+}
+
+# 路径过滤器 (-Name / -Exclude)：Windows 上 \ 就是目录分隔符，匹配前统一成 /。
+# 这是与 sh 版唯一有意保留的差异：Linux 上 \ 是合法的文件名字符与 glob 转义，sh 版不做任何转换。
+# 对 -like 来说这个转换是安全的：它的转义符是反引号，不是反斜杠，不会破坏转义语义。
+# -NameRegex 不转换：正则里的 \ 是转义。
+if ($Name)    { $Name    = @($Name    | ForEach-Object { $_ -replace '\\', '/' }) }
+if ($Exclude) { $Exclude = @($Exclude | ForEach-Object { $_ -replace '\\', '/' }) }
+
+if ($Tag)     { $Tag     = @($Tag     | ForEach-Object { $_ -split ',' } | Where-Object { $_ }) }
+
+# 显式传了 -Name $null / -Name @() 之类：绑定得过去，但会让过滤器悄悄失效，所以拦下来。
+foreach ($pn in @('Name', 'NameRegex', 'Exclude', 'Tag')) {
+    if ($PSBoundParameters.ContainsKey($pn)) {
+        $pv = $PSBoundParameters[$pn]
+        if ($null -eq $pv -or @($pv).Count -eq 0) { Exit-WithUsage "-$pn 的值不能为空" }
+    }
+}
+
+# 通配符是否合法：-like 遇到非法写法 (如未闭合的 [) 会在匹配时才抛 WildcardPatternException，
+# 放到过滤循环里就成了半路崩溃。这里用和过滤时完全相同的运算先试一次。
+function Get-GlobError {
+    param([string]$Pattern)
+    try {
+        $null = ('' -clike $Pattern)
+        return ''
+    } catch {
+        return $_.Exception.Message
+    }
+}
+foreach ($pair in @(@('-Name', $Name), @('-Exclude', $Exclude))) {
+    foreach ($pat in @($pair[1])) {
+        if ($null -eq $pat) { continue }
+        $globErr = Get-GlobError -Pattern ([string]$pat)
+        if ($globErr) { Exit-WithUsage "$($pair[0]) 不是合法的通配符: '$pat' ($globErr)" }
+    }
+}
+
+# ============================================================
+# -NameRegex 正则合法性预检（.NET 正则；-cmatch 用的就是同一个引擎）
+# ============================================================
+foreach ($rx in @($NameRegex)) {
+    if ($null -eq $rx) { continue }
+    try {
+        $null = [System.Text.RegularExpressions.Regex]::new([string]$rx)
+    } catch {
+        Exit-WithUsage "-NameRegex 不是合法的正则: '$rx' ($($_.Exception.Message))"
+    }
+}
+
+# ============================================================
+# -Shard 解析（M/N）
+#   用 ContainsKey 判断"是否给了"：-Shard '' 也算给了 (然后因格式不对被拒绝)，
+#   而不是被当成没给而静默忽略。\z 表示真正的字符串结尾 ($ 会在末尾换行前匹配)。
+# ============================================================
+$shardGiven = $PSBoundParameters.ContainsKey('Shard')
+$shardIndex = 1
+$shardTotal = 1
+if ($shardGiven) {
+    if ($Shard -cmatch '^([0-9]{1,9})/([0-9]{1,9})\z') {
+        $shardIndex = [int]$Matches[1]
+        $shardTotal = [int]$Matches[2]
+    } else {
+        Exit-WithUsage "-Shard 格式应为 M/N (例如 2/4)，收到: '$Shard'"
+    }
+    if ($shardIndex -lt 1 -or $shardIndex -gt $shardTotal) {
+        Exit-WithUsage "-Shard M/N 要求 1 <= M <= N，收到: $shardIndex/$shardTotal"
+    }
 }
 
 # ============================================================
@@ -108,7 +207,7 @@ function Find-WorkspaceRoot {
     while ($dir) {
         $testsPath = Join-Path $dir.FullName 'Tests'
         $stdPath   = Join-Path $dir.FullName 'Standard'
-        if ((Test-Path -LiteralPath $testsPath) -and (Test-Path -LiteralPath $stdPath)) {
+        if ((Test-Path -LiteralPath $testsPath -PathType Container) -and (Test-Path -LiteralPath $stdPath -PathType Container)) {
             return $dir.FullName
         }
         # 不用 Split-Path：它的 -Parent 只在 -Path 参数集里，与 -LiteralPath 不能同时使用；
@@ -131,7 +230,7 @@ function Get-XiyiVersion {
                 $inPackage = ($line -match '^\s*\[package\]\s*(#.*)?$')
                 continue
             }
-            if ($inPackage -and $line -match '^\s*version\s*=\s*"([^"]+)"') {
+            if ($inPackage -and $line -match '^\s*version\s*=\s*["'']([^"'']+)["'']') {
                 return $Matches[1]
             }
         }
@@ -164,6 +263,10 @@ function Resolve-TargetDir {
     return (Join-Path $CompilerRoot 'target')
 }
 
+# $PSScriptRoot 只有"以脚本文件方式运行"时才有值 (用 -Command 或粘贴执行时为空)
+if (-not $PSScriptRoot) {
+    Exit-WithError '无法确定脚本所在目录：请把本文件保存下来再运行 (pwsh -File .\run_all_tests.ps1)'
+}
 $COMPILER_ROOT  = $PSScriptRoot
 $WORKSPACE_ROOT = Find-WorkspaceRoot -StartDir $COMPILER_ROOT
 if (-not $WORKSPACE_ROOT) {
@@ -192,6 +295,17 @@ if ((Test-Path -LiteralPath (Join-Path $LOG_DIR "$runId.log")) -or (Test-Path -L
 $LOG_FILE  = Join-Path $LOG_DIR "$runId.log"
 $JSON_FILE = Join-Path $LOG_DIR "$runId.json"
 
+# -RerunFailed 的数据来源 = 上一次"完成"的运行留下的 JSON (被中断的运行不会产生 JSON)。
+# 必须赶在轮转之前选定并加以保护，否则 -KeepLogs 1 时它会被当成旧文件清掉。
+# 只认本脚本命名规则 (YYYYMMDD_HHMMSS*.json)，不会误取别人放进来的其它 json。
+$rerunSrc = ''
+if ($RerunFailed) {
+    $candidates = @(Get-ChildItem -LiteralPath $LOG_DIR -Filter '*.json' -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^[0-9]{8}_[0-9]{6}.*\.json\z' -and $_.FullName -ne $JSON_FILE } |
+        Sort-Object -Property @{ Expression = 'LastWriteTime'; Descending = $true }, @{ Expression = 'Name'; Descending = $true })
+    if ($candidates.Count -gt 0) { $rerunSrc = $candidates[0].FullName }
+}
+
 function Add-LogLine {
     param([string]$Text)
     try {
@@ -209,24 +323,31 @@ try {
 
 function Remove-OldLogs {
     # $KeepOthers：除"本次文件"以外还要保留几份
-    param([string]$Filter, [int]$KeepOthers, [string[]]$Protect)
-    $others = @(Get-ChildItem -LiteralPath $LOG_DIR -Filter $Filter -File -ErrorAction SilentlyContinue |
-        Where-Object { $Protect -notcontains $_.FullName } |
+    param([string]$Extension, [int]$KeepOthers, [string[]]$Protect)
+    # Windows 的 -Filter 对"恰好 3 个字符的扩展名"有历史遗留行为 (如 *.log 也会匹配 x.logs)，
+    # 所以拿到结果后再按扩展名精确核对一遍，避免误删别的文件。
+    $others = @(Get-ChildItem -LiteralPath $LOG_DIR -Filter "*$Extension" -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Extension -eq $Extension -and $Protect -notcontains $_.FullName } |
         Sort-Object -Property @{ Expression = 'LastWriteTime'; Descending = $true }, @{ Expression = 'Name'; Descending = $true })
     if ($others.Count -gt $KeepOthers) {
         $others | Select-Object -Skip $KeepOthers | Remove-Item -Force -ErrorAction SilentlyContinue
     }
 }
 # .log 本次已创建；.json 要到最后才写。两者都是"再留 KeepLogs-1 份旧的"，总数恰为 KeepLogs。
-Remove-OldLogs -Filter '*.log'  -KeepOthers ($KeepLogs - 1) -Protect @($LOG_FILE, $JSON_FILE)
-Remove-OldLogs -Filter '*.json' -KeepOthers ($KeepLogs - 1) -Protect @($LOG_FILE, $JSON_FILE)
+# -RerunFailed 的数据源也要保护，否则 -KeepLogs 1 时它会先被清掉。
+$protectSet = @($LOG_FILE, $JSON_FILE)
+if ($rerunSrc) { $protectSet += $rerunSrc }
+Remove-OldLogs -Extension '.log'  -KeepOthers ($KeepLogs - 1) -Protect $protectSet
+Remove-OldLogs -Extension '.json' -KeepOthers ($KeepLogs - 1) -Protect $protectSet
 
 $xiyiVersion = Get-XiyiVersion -CompilerRoot $COMPILER_ROOT
 
 Write-Host '========================================' -ForegroundColor Cyan
 Write-Host ' 希夷编译器测试套件' -ForegroundColor Cyan
 Write-Host " xiyi-compiler 版本: $xiyiVersion" -ForegroundColor Cyan
-Write-Host " Expect 过滤: $Expect   并发: $Jobs   超时(默认): ${TimeoutSeconds}s" -ForegroundColor Cyan
+$shardInfo = ''
+if ($shardGiven) { $shardInfo = "   分片: $shardIndex/$shardTotal" }
+Write-Host " Expect 过滤: $Expect   并发: $Jobs   超时(默认): ${TimeoutSeconds}s${shardInfo}" -ForegroundColor Cyan
 Write-Host " 编译器目录: $COMPILER_ROOT" -ForegroundColor DarkGray
 Write-Host " 标准库目录: $STDLIB" -ForegroundColor DarkGray
 Write-Host " 测试目录:   $TEST_DIR" -ForegroundColor DarkGray
@@ -237,6 +358,9 @@ Write-Host ''
 Add-LogLine "运行 ID: $runId"
 Add-LogLine "版本: $xiyiVersion"
 Add-LogLine "参数: Expect=$Expect Jobs=$Jobs SkipBuild=$SkipBuild Release=$Release UpdateGoldens=$UpdateGoldens FailFast=$FailFast StrictCrash=$StrictCrash"
+$shardLog = '无'
+if ($shardGiven) { $shardLog = "$shardIndex/$shardTotal" }
+Add-LogLine ("过滤: name=[$($Name -join '; ')] name-regex=[$($NameRegex -join '; ')] exclude=[$($Exclude -join '; ')] tag=[$($Tag -join '; ')] rerun-failed=$([int][bool]$RerunFailed) shard=$shardLog")
 
 # ============================================================
 # 步骤1：编译（可跳过）
@@ -288,7 +412,9 @@ Write-Host ''
 # ============================================================
 Write-Host "[2/4] 扫描测试用例（$TEST_DIR）..." -ForegroundColor Yellow
 
-$foundFiles = @(Get-ChildItem -LiteralPath $TEST_DIR -Filter '*.xiyi' -File -Recurse -ErrorAction SilentlyContinue)
+$foundFiles = @(Get-ChildItem -LiteralPath $TEST_DIR -Filter '*.xiyi' -File -Recurse -ErrorAction SilentlyContinue -ErrorVariable scanErrors)
+# 权限等原因读不了的目录：不静默，否则"少了几个用例"没人知道
+foreach ($e in @($scanErrors)) { Write-Warn "扫描 Tests/ 时出错，可能漏掉用例: $($e.Exception.Message)" }
 if ($foundFiles.Count -eq 0) {
     Exit-WithError "$TEST_DIR 下找不到任何 .xiyi 文件"
 }
@@ -381,10 +507,10 @@ function Get-InlineMeta {
 }
 
 # 先按相对路径 (正斜杠) 做"序数比较"排序，保证各机器上顺序一致，也与 sh 版一致
-$testDirNorm = $TEST_DIR.TrimEnd('\', '/')
 $rows = [System.Collections.Generic.List[object]]::new()
 foreach ($f in $foundFiles) {
-    $relPath = $f.FullName.Substring($testDirNorm.Length).TrimStart('\', '/') -replace '\\', '/'
+    # GetRelativePath 不依赖"两个路径前缀字面相同" (大小写、结尾分隔符都不会让它错位)
+    $relPath = [System.IO.Path]::GetRelativePath($TEST_DIR, $f.FullName) -replace '\\', '/'
     $rows.Add([pscustomobject]@{ Rel = $relPath; Full = $f.FullName })
 }
 $rows.Sort([System.Comparison[object]]{ param($a, $b) [string]::CompareOrdinal($a.Rel, $b.Rel) })
@@ -441,32 +567,115 @@ foreach ($key in $overrides.Keys) {
     }
 }
 
-# ===== 过滤 =====
+# ============================================================
+# 过滤
+#   一个用例要被选中，必须"同时"满足 (AND)：
+#     1. -Expect                期望结果相符
+#     2. -Name / -NameRegex     两者合起来任一命中即可 (OR)；都没给就不限制
+#     3. -Tag                   任一命中即可 (OR)；没给就不限制
+#     4. -RerunFailed           在上一次完成的运行里是 FAIL
+#   满足以上之后，被任何一条 -Exclude 命中就剔除 (优先级最高)。
+#   最后才按 -Shard 切片：切片永远作用在"已经过滤完"的有序列表上。
+#   路径匹配一律区分大小写 (-clike / -cmatch)，与 bash 的 [[ == ]] / [[ =~ ]] 一致；
+#   tag 匹配大小写不敏感 (sh 版把两边都小写化)，因为 tag 词元惯例上全小写。
+# ============================================================
+
+# -RerunFailed: 读取上一次完成的运行里失败的用例
+$failedSet = @{}
+if ($RerunFailed) {
+    if (-not $rerunSrc) {
+        Exit-WithError "-RerunFailed: $LOG_DIR 下没有任何历史 JSON 结果，请先完整跑一次"
+    }
+    $srcName = [System.IO.Path]::GetFileName($rerunSrc)
+    try {
+        $prev = Get-Content -LiteralPath $rerunSrc -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        Exit-WithError "-RerunFailed: 无法读取 ${srcName}: $($_.Exception.Message)"
+    }
+    if ($null -eq $prev.Results) {
+        Exit-WithError "-RerunFailed: ${srcName} 缺少 Results 数组"
+    }
+    foreach ($item in @($prev.Results)) {
+        if ($item -and $item.Status -eq 'FAIL' -and $item.RelPath) {
+            $failedSet["$($item.RelPath)"] = $true
+            # 用例被改名或删除后，旧记录对不上任何文件：提醒一声，而不是静默丢掉
+            if (-not $relSet.Contains("$($item.RelPath)")) {
+                Write-Warn "上次失败的用例已不存在，将被忽略: $($item.RelPath)"
+            }
+        }
+    }
+    if ($failedSet.Count -eq 0) {
+        # 上次全绿不是错误："先跑一遍、再重跑失败项"的用法里，这应当算成功
+        Write-Host "✅ ${srcName} 里没有失败的用例，无需重跑" -ForegroundColor Green
+        Add-LogLine "-RerunFailed: ${srcName} 中没有失败用例，未执行任何测试"
+        exit 0
+    }
+    Write-Host "[rerun-failed] 从 ${srcName} 载入 $($failedSet.Count) 个失败用例" -ForegroundColor DarkGray
+}
+
 $filtered = [System.Collections.Generic.List[object]]::new()
 foreach ($tc in $testCases) {
     if ($Expect -ne 'all') {
         $want = if ($Expect -eq 'pass') { 'PASS' } else { 'FAIL' }
         if ($tc.Expect -ne $want) { continue }
     }
-    if ($Name) {
+
+    if (($Name -and $Name.Count -gt 0) -or ($NameRegex -and $NameRegex.Count -gt 0)) {
         $matched = $false
-        foreach ($pat in $Name) {
-            if ($tc.RelPath -like $pat) { $matched = $true; break }
+        if ($Name) {
+            foreach ($pat in $Name) {
+                if ($tc.RelPath -clike $pat) { $matched = $true; break }
+            }
+        }
+        if (-not $matched -and $NameRegex) {
+            foreach ($rx in $NameRegex) {
+                if ($tc.RelPath -cmatch $rx) { $matched = $true; break }
+            }
         }
         if (-not $matched) { continue }
     }
-    if ($Tag) {
+
+    if ($Tag -and $Tag.Count -gt 0) {
         $matched = $false
         foreach ($want in $Tag) {
             if ($tc.Tags -contains $want) { $matched = $true; break }
         }
         if (-not $matched) { continue }
     }
+
+    if ($RerunFailed -and -not $failedSet.ContainsKey($tc.RelPath)) { continue }
+
+    if ($Exclude -and $Exclude.Count -gt 0) {
+        $excluded = $false
+        foreach ($pat in $Exclude) {
+            if ($tc.RelPath -clike $pat) { $excluded = $true; break }
+        }
+        if ($excluded) { continue }
+    }
+
     $filtered.Add($tc)
 }
 
 if ($filtered.Count -eq 0) {
     Exit-WithError '过滤后没有匹配的测试用例'
+}
+
+# ============================================================
+# 分片
+#   $rows 已经按 CompareOrdinal 排好序，与 sh 版的 LC_ALL=C sort 一致；
+#   按位置轮转 (而非按目录切块)，可以把相邻的、通常耗时相近的用例打散，
+#   负载更均衡。N 大于用例数时后面的分片会空——不是错误。
+# ============================================================
+if ($shardGiven) {
+    $shardBefore = $filtered.Count
+    $shardPicked = [System.Collections.Generic.List[object]]::new()
+    for ($i = 0; $i -lt $filtered.Count; $i++) {
+        if (($i % $shardTotal) -eq ($shardIndex - 1)) {
+            $shardPicked.Add($filtered[$i])
+        }
+    }
+    $filtered = $shardPicked
+    Write-Host "[shard $shardIndex/$shardTotal] 过滤后共 $shardBefore 个用例，本片 $($filtered.Count) 个" -ForegroundColor DarkGray
 }
 
 Write-Host "共 $($filtered.Count) 个测试用例（目录下总计发现 $($testCases.Count) 个）"
@@ -580,7 +789,6 @@ function ConvertTo-ExpectedExitCode {
     return $null
 }
 
-# 识别崩溃：NTSTATUS 错误码 (0xC0000000-0xC000FFFF，如访问违例 / 栈溢出 / fail-fast) 或 panic / ICE 标志。
 function Get-CrashInfo {
     param($ExitCode, [string]$Stderr)
     if ($null -ne $ExitCode) {
@@ -612,8 +820,10 @@ try {
 
     if ($updateGoldens) {
         try {
-            Set-Content -LiteralPath $test.OutGolden -Value $r.Stdout -Encoding utf8 -NoNewline -ErrorAction Stop
-            Set-Content -LiteralPath $test.ErrGolden -Value $r.Stderr -Encoding utf8 -NoNewline -ErrorAction Stop
+            # 直接用 .NET 写：UTF-8 无 BOM、不加换行，空内容也会得到空文件
+            $utf8 = [System.Text.UTF8Encoding]::new($false)
+            [System.IO.File]::WriteAllText($test.OutGolden, $r.Stdout, $utf8)
+            [System.IO.File]::WriteAllText($test.ErrGolden, $r.Stderr, $utf8)
         } catch {
             return (New-CaseResult -Status 'FAIL' -Test $test -Reasons @("无法写入 golden: $($_.Exception.Message)") `
                 -ExitCode $r.ExitCode -Elapsed $r.Elapsed -Stdout $r.Stdout -Stderr $r.Stderr)
@@ -625,7 +835,6 @@ try {
     $ok = $true
     $reasons = [System.Collections.Generic.List[string]]::new()
 
-    # --- 退出码：.exit golden 优先，否则按 Expect 推导 ---
     $haveExitGolden = Test-Path -LiteralPath $test.ExitGolden -PathType Leaf
     $expectedExit = $null
     if ($haveExitGolden) {
@@ -638,12 +847,9 @@ try {
         }
     }
 
-    if ($haveExitGolden -and $null -eq $expectedExit) {
-        # .exit golden 存在但内容无效：上面已记录原因并置 ok=$false，
-        # 这里显式不再回退到"按 Expect 推导"，避免跳过退出码检查。
-        $ok = $false
-    } elseif ($null -ne $expectedExit) {
-        if ($r.ExitCode -ne $expectedExit) {
+    if ($haveExitGolden) {
+        # golden 无效的情况上面已经记了原因并置为失败，这里只处理有效值
+        if ($null -ne $expectedExit -and $r.ExitCode -ne $expectedExit) {
             $ok = $false
             $reasons.Add("exit $($r.ExitCode), expected $expectedExit")
         }
@@ -659,7 +865,6 @@ try {
         }
     }
 
-    # --- golden 比对（有才比；没有就不强行要求空输出，避免历史测试集体炸红）---
     if (Test-Path -LiteralPath $test.OutGolden -PathType Leaf) {
         $golden = Get-Content -LiteralPath $test.OutGolden -Raw -Encoding utf8
         if ((Format-Normalized -Text $r.Stdout) -cne (Format-Normalized -Text $golden)) {
@@ -675,7 +880,6 @@ try {
         }
     }
 
-    # --- stderr 子串（序数比较，等同 grep -F）---
     if ($test.StderrContains) {
         if ($r.Stderr.IndexOf([string]$test.StderrContains, [System.StringComparison]::Ordinal) -lt 0) {
             $ok = $false
@@ -683,7 +887,6 @@ try {
         }
     }
 
-    # --- 崩溃处置 / 提示："期望失败"的用例很容易被编译器崩溃悄悄蒙混过关 ---
     $crash = Get-CrashInfo -ExitCode $r.ExitCode -Stderr $r.Stderr
     if ($crash -and -not $haveExitGolden -and $test.Expect -eq 'FAIL') {
         if ($strictCrash) {
@@ -735,7 +938,6 @@ function Write-CaseResult {
     }
 }
 
-# 并行时某个 worker 没有产出结果 (异常/被杀)：必须记为失败，绝不能让汇总悄悄漏掉
 function New-MissingResult {
     param($test)
     [pscustomobject]@{
@@ -753,6 +955,7 @@ Write-Host ''
 
 $results   = [System.Collections.Generic.List[object]]::new()
 $completed = $false
+$doneCount = 0      # 已经出结果的用例数，仅用于"被中断"时的日志
 
 try {
     if ($Jobs -gt 1) {
@@ -764,21 +967,28 @@ try {
         $updArg    = [bool]$UpdateGoldens
         $strictArg = [bool]$StrictCrash
 
-        $parallelOut = @($filtered | ForEach-Object -ThrottleLimit $Jobs -Parallel {
+        # 边完成边打印 (按完成顺序)，长时间运行时不至于"一片空白"；
+        # 但 JSON / 汇总仍按排序后的顺序，保证与串行模式、与 sh 版一致。
+        $byRel = @{}
+        $filtered | ForEach-Object -ThrottleLimit $Jobs -Parallel {
             $sb = [scriptblock]::Create($using:CaseRunnerText)
             & $sb $_ $using:exeArg $using:stdlibArg $using:workArg $using:updArg $using:strictArg
-        })
-
-        # 并行输出是完成顺序；按用例顺序归位，并补齐缺失结果
-        $byRel = @{}
-        foreach ($r in $parallelOut) {
-            if ($r -and $r.RelPath) { $byRel[[string]$r.RelPath] = $r }
+        } | ForEach-Object {
+            # 执行器只应返回一个带 RelPath 的结果对象；其它杂散输出直接忽略
+            if ($_ -and $_.RelPath) {
+                $byRel[[string]$_.RelPath] = $_
+                $doneCount++
+                Write-CaseResult $_
+            }
         }
+
         foreach ($tc in $filtered) {
             $r = $byRel[[string]$tc.RelPath]
-            if (-not $r) { $r = New-MissingResult -test $tc }
+            if (-not $r) {
+                $r = New-MissingResult -test $tc
+                Write-CaseResult $r
+            }
             $results.Add($r)
-            Write-CaseResult $r
         }
     } else {
         $runner = [scriptblock]::Create($CaseRunnerText)
@@ -787,6 +997,7 @@ try {
             if ($r -is [array]) { $r = $r[-1] }
             if (-not $r) { $r = New-MissingResult -test $tc }
             $results.Add($r)
+            $doneCount++
             Write-CaseResult $r
             if ($FailFast -and $r.Status -eq 'FAIL') {
                 Write-Host '⏹  -FailFast 触发，停止后续测试' -ForegroundColor Yellow
@@ -797,7 +1008,7 @@ try {
     $completed = $true
 } finally {
     if (-not $completed) {
-        Add-LogLine "运行被中断: 已完成 $($results.Count)/$($filtered.Count) 个用例；未生成汇总与 JSON"
+        Add-LogLine "运行被中断: 已完成 $doneCount/$($filtered.Count) 个用例；未生成汇总与 JSON"
     }
 }
 Write-Host ''
@@ -839,7 +1050,6 @@ Write-Host " 日志:  $LOG_FILE"
 Write-Host " 结果:  $JSON_FILE"
 Write-Host '========================================' -ForegroundColor Cyan
 
-# JSON 字段与 sh 版保持一致 (不含 Stdout/Stderr，完整输出看 .log)；先写临时文件再移动，避免中断留下半截文件
 $jsonResults = @(foreach ($r in $results) {
     [pscustomobject][ordered]@{
         RelPath  = $r.RelPath
@@ -865,20 +1075,25 @@ $summary = [pscustomobject][ordered]@{
     Results  = $jsonResults
 }
 
+$jsonTmp = "$JSON_FILE.tmp.$PID"
 try {
-    $jsonTmp = "$JSON_FILE.tmp.$PID"
     [System.IO.File]::WriteAllText($jsonTmp, ($summary | ConvertTo-Json -Depth 4), [System.Text.UTF8Encoding]::new($false))
     [System.IO.File]::Move($jsonTmp, $JSON_FILE, $true)
 } catch {
     Write-Warn "写入 $JSON_FILE 失败: $($_.Exception.Message)"
+    Remove-Item -LiteralPath $jsonTmp -Force -ErrorAction SilentlyContinue
 }
 
 Add-LogLine "汇总: 总计 $total, 通过 $passedCount, 失败 $failedCount, 超时 $timeoutCount, 跳过 $skippedCount, 已更新 $updatedCount"
 
-# ===== 退出码 =====
 if ($failedCount -gt 0) {
     Write-Host "❌ 有 $failedCount 个测试失败" -ForegroundColor Red
     exit 1
+}
+
+if ($total -eq 0) {
+    Write-Host "ℹ️  本次没有分到任何用例 (分片 $shardIndex/$shardTotal 为空)，视为成功" -ForegroundColor Yellow
+    exit 0
 }
 
 if ($UpdateGoldens) {
