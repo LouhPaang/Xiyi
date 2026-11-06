@@ -278,8 +278,9 @@ cleanup() {
         print -r -- "运行被 $INTERRUPTED 中断: 已派发 $DISPATCHED/${#FILTERED} 个用例；未生成汇总与 JSON" >> $LOG_FILE 2>/dev/null
     fi
     # 本脚本启动的一切 (xiyi、watchdog、worker) 都是 $$ 的后代；自己不能杀自己
+    # 先杀上层再杀下层：worker 先死，就不会在 xiyi 被杀之后接着去启动下一个用例
     local -a mine=( ${=$(descendants_of $$)} )
-    mine=( ${mine:#$$} )
+    mine=( ${(Oa)mine:#$$} )
     (( $#mine )) && kill -KILL $mine 2>/dev/null
     [[ -n $RESULTS_DIR && -d $RESULTS_DIR ]] && rm -rf -- $RESULTS_DIR
     exit $rc
@@ -357,24 +358,29 @@ rotate_logs log  $KEEP_LOGS            # 本次 .log 已创建，含在 KEEP_LOG
 rotate_logs json $(( KEEP_LOGS - 1 ))  # 本次 .json 在最后才写，先给它留一个位置
 
 # ============================================================
-# 版本号：只读 [package] 段，避免误取依赖的 version = "..."
+# cargo metadata：只调用一次，版本号与 target 目录共用
+#   --no-deps 不需要依赖已下载，--offline 避免联网。
+#   比自己解析 Cargo.toml 稳：version.workspace = true 这类继承写法 cargo 会替我们解析好。
 # ============================================================
+typeset CARGO_META=
+if (( $+commands[cargo] && $+commands[jq] )); then
+    CARGO_META=$(cd -q -- $COMPILER_ROOT && cargo metadata --no-deps --format-version 1 --offline 2>/dev/null) \
+        || CARGO_META=
+fi
+
+# 取 $COMPILER_ROOT/Cargo.toml 对应那个包的版本；
+# 路径对不上 (如符号链接) 时，只有一个包才采用它，否则宁可显示 unknown 也不猜。
 get_xiyi_version() {
-    local -a match mbegin mend
-    local line in_pkg=0 v=unknown
-    local re_section='^[[:space:]]*\[' re_package='^[[:space:]]*\[package\][[:space:]]*(#.*)?$'
-    local re_version='^[[:space:]]*version[[:space:]]*=[[:space:]]*["'\'']([^"'\'']+)["'\'']'
-    [[ -f $COMPILER_ROOT/Cargo.toml ]] || { print unknown; return; }
-    while IFS= read -r line || [[ -n $line ]]; do
-        line=${line%$'\r'}
-        if [[ $line =~ $re_section ]]; then
-            [[ $line =~ $re_package ]] && in_pkg=1 || in_pkg=0
-        elif (( in_pkg )) && [[ $line =~ $re_version ]]; then
-            v=$match[1]
-            break
-        fi
-    done < $COMPILER_ROOT/Cargo.toml
-    print -r -- $v
+    local v=
+    if [[ -n $CARGO_META ]]; then
+        v=$(jq -r --arg m $COMPILER_ROOT/Cargo.toml '
+            .packages
+            | (map(select(.manifest_path == $m)) | first)
+              // (if length == 1 then .[0] else null end)
+            | .version // empty
+        ' <<< $CARGO_META 2>/dev/null) || v=
+    fi
+    print -r -- ${v:-unknown}
 }
 typeset -r XIYI_VERSION=$(get_xiyi_version)
 
@@ -383,10 +389,7 @@ typeset -r XIYI_VERSION=$(get_xiyi_version)
 # ============================================================
 resolve_target_dir() {
     local d=
-    if (( $+commands[cargo] && $+commands[jq] )); then
-        d=$(cd -q -- $COMPILER_ROOT && cargo metadata --no-deps --format-version 1 --offline 2>/dev/null \
-            | jq -r '.target_directory // empty' 2>/dev/null) || d=
-    fi
+    [[ -n $CARGO_META ]] && d=$(jq -r '.target_directory // empty' <<< $CARGO_META 2>/dev/null)
     if [[ -z $d ]]; then
         if [[ -n ${CARGO_TARGET_DIR:-} ]]; then
             d=$CARGO_TARGET_DIR
@@ -708,6 +711,31 @@ is_excluded() {
 
 (( $#FILTERED )) || fatal "过滤后没有匹配的测试用例"
 
+# ---- 分片前的"过滤结果指纹" ----
+# --shard 的正确性依赖各机器的过滤结果完全一致。这里对分片前的有序相对路径列表
+# (每条路径后跟一个 \n) 求 SHA-256，连同用例数写进 JSON 的 FilterCount / FilterDigest：
+# CI 汇总各分片的报告时，这两项不全相同，就说明各机器看到的 Tests/ 不一致
+# (浅克隆深度不同、中途有新提交等)，分片可能重叠或漏用例。
+# 四个脚本对同一份用例列表算出的值相同，所以 Linux / macOS / Windows 分片混用也能互相比对。
+# 只覆盖"选中了哪些用例"，不覆盖用例文件内容的改动。
+
+# 对标准输入求 SHA-256 (小写十六进制)；没有可用工具时返回 1。
+sha256_stdin() {
+    local out
+    if   (( $+commands[shasum] ));    then out=$(shasum -a 256)
+    elif (( $+commands[sha256sum] )); then out=$(sha256sum)
+    else return 1
+    fi
+    print -rn -- ${out%% *}
+}
+
+typeset -i FILTER_COUNT=$#FILTERED
+typeset FILTER_DIGEST
+FILTER_DIGEST=$(for i in $FILTERED; do print -r -- $T_REL[i]; done | sha256_stdin) || FILTER_DIGEST=
+if (( SHARD_GIVEN )) && [[ -z $FILTER_DIGEST ]]; then
+    warn "找不到 shasum / sha256sum，无法生成分片指纹 (JSON 里的 FilterDigest 留空)"
+fi
+
 # ---- 分片 ----
 # FILTERED 的顺序 = 扫描时按字节序排好的相对路径顺序，与机器、locale 无关，所以各分片划分一致。
 # 按位置轮转 (而非按目录切块)，把相邻的、通常耗时相近的用例打散到不同分片，负载更均衡。
@@ -725,6 +753,7 @@ if (( SHARD_GIVEN )); then
 fi
 
 print -r -- "共 $#FILTERED 个测试用例（目录下总计发现 $#T_REL 个）"
+(( SHARD_GIVEN )) && print -r -- "${C_GRAY}[shard] 过滤结果指纹: $FILTER_COUNT 个 / ${FILTER_DIGEST:-无} (各分片应完全相同)${C_RESET}"
 print
 
 # ============================================================
@@ -1059,6 +1088,10 @@ write_json() {
     print -r -- "  \"Timeouts\": $timeouts,"
     print -r -- "  \"Skipped\": $skipped,"
     print -r -- "  \"Updated\": $updated,"
+    print -r -- "  \"ShardIndex\": $SHARD_INDEX,"
+    print -r -- "  \"ShardTotal\": $SHARD_TOTAL,"
+    print -r -- "  \"FilterCount\": $FILTER_COUNT,"
+    print -r -- "  \"FilterDigest\": \"$FILTER_DIGEST\","
     print -rn -- '  "Results": ['
     for i in $EXECUTED; do
         rec=( "${(@f)$(<$RESULTS_DIR/$i/res)}" )

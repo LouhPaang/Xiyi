@@ -24,8 +24,7 @@
 # 退出码: 0 成功 (含"空分片"与"上次没有失败"); 1 有用例失败或运行期致命错误; 2 脚本自己检出的参数错误
 #         (参数绑定阶段由 PowerShell 自身拦截的错误，如 -Jobs 0，退出码是 1，这是 PowerShell 的行为)。
 # 平台细节差异: sh 以"信号 / 退出码 > 128"识别崩溃，这里以 NTSTATUS 错误码
-# (0xC0000000-0xC000FFFF，如访问违例、栈溢出) 识别；超时由 WaitForExit 直接判定，
-# 不依赖退出码。
+# (0xC0000000-0xC000FFFF，如访问违例、栈溢出) 识别；超时由 WaitForExit 直接判定，不依赖退出码。
 
 param(
     [ValidateSet('all', 'pass', 'fail')]
@@ -219,43 +218,45 @@ function Find-WorkspaceRoot {
     return $null
 }
 
-# 版本号从 Cargo.toml 的 [package] 段读，不在脚本里写死，也不会误取依赖项的 version。
-function Get-XiyiVersion {
+# cargo metadata：只调用一次，版本号与 target 目录共用。
+#   --no-deps 不需要依赖已下载，--offline 避免联网。
+#   比自己解析 Cargo.toml 稳：version.workspace = true 这类继承写法 cargo 会替我们解析好。
+function Get-CargoMetadata {
     param([string]$CompilerRoot)
-    $cargoToml = Join-Path $CompilerRoot 'Cargo.toml'
-    if (Test-Path -LiteralPath $cargoToml) {
-        $inPackage = $false
-        foreach ($line in (Get-Content -LiteralPath $cargoToml -ErrorAction SilentlyContinue)) {
-            if ($line -match '^\s*\[') {
-                $inPackage = ($line -match '^\s*\[package\]\s*(#.*)?$')
-                continue
-            }
-            if ($inPackage -and $line -match '^\s*version\s*=\s*["'']([^"'']+)["'']') {
-                return $Matches[1]
-            }
-        }
+    if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) { return $null }
+    Push-Location -LiteralPath $CompilerRoot
+    try {
+        $metaText = & cargo metadata --no-deps --format-version 1 --offline 2>$null | Out-String
+        $metaExit = $LASTEXITCODE
+        if ($metaExit -eq 0 -and $metaText) { return ($metaText | ConvertFrom-Json) }
+    } catch {
+        # 忽略：版本号显示 unknown，target 目录走下面的回退
+    } finally {
+        Pop-Location
+    }
+    return $null
+}
+
+# 取 $CompilerRoot/Cargo.toml 对应那个包的版本；
+# 路径对不上 (如符号链接) 时，只有一个包才采用它，否则宁可显示 unknown 也不猜。
+function Get-XiyiVersion {
+    param($Meta, [string]$CompilerRoot)
+    if ($Meta -and $Meta.packages) {
+        $manifest = [System.IO.Path]::GetFullPath((Join-Path $CompilerRoot 'Cargo.toml'))
+        $pkgs = @($Meta.packages)
+        $pkg  = $pkgs | Where-Object {
+            [string]::Equals([System.IO.Path]::GetFullPath([string]$_.manifest_path), $manifest, [System.StringComparison]::OrdinalIgnoreCase)
+        } | Select-Object -First 1
+        if (-not $pkg -and $pkgs.Count -eq 1) { $pkg = $pkgs[0] }
+        if ($pkg -and $pkg.version) { return [string]$pkg.version }
     }
     return 'unknown'
 }
 
-# target 目录：优先问 cargo (能反映 workspace 与 .cargo/config)，其次 CARGO_TARGET_DIR，最后默认值。
+# target 目录：优先用 cargo 报告的 (能反映 workspace 与 .cargo/config)，其次 CARGO_TARGET_DIR，最后默认值。
 function Resolve-TargetDir {
-    param([string]$CompilerRoot)
-    if (Get-Command cargo -ErrorAction SilentlyContinue) {
-        Push-Location -LiteralPath $CompilerRoot
-        try {
-            $metaText = & cargo metadata --no-deps --format-version 1 --offline 2>$null | Out-String
-            $metaExit = $LASTEXITCODE
-            if ($metaExit -eq 0 -and $metaText) {
-                $meta = $metaText | ConvertFrom-Json
-                if ($meta.target_directory) { return [string]$meta.target_directory }
-            }
-        } catch {
-            # 忽略，走下面的回退
-        } finally {
-            Pop-Location
-        }
-    }
+    param($Meta, [string]$CompilerRoot)
+    if ($Meta -and $Meta.target_directory) { return [string]$Meta.target_directory }
     if ($env:CARGO_TARGET_DIR) {
         if ([System.IO.Path]::IsPathRooted($env:CARGO_TARGET_DIR)) { return $env:CARGO_TARGET_DIR }
         return (Join-Path $CompilerRoot $env:CARGO_TARGET_DIR)
@@ -340,7 +341,8 @@ if ($rerunSrc) { $protectSet += $rerunSrc }
 Remove-OldLogs -Extension '.log'  -KeepOthers ($KeepLogs - 1) -Protect $protectSet
 Remove-OldLogs -Extension '.json' -KeepOthers ($KeepLogs - 1) -Protect $protectSet
 
-$xiyiVersion = Get-XiyiVersion -CompilerRoot $COMPILER_ROOT
+$cargoMeta   = Get-CargoMetadata -CompilerRoot $COMPILER_ROOT
+$xiyiVersion = Get-XiyiVersion -Meta $cargoMeta -CompilerRoot $COMPILER_ROOT
 
 Write-Host '========================================' -ForegroundColor Cyan
 Write-Host ' 希夷编译器测试套件' -ForegroundColor Cyan
@@ -395,8 +397,8 @@ Write-Host ''
 # 步骤2：定位可执行文件与标准库
 # ============================================================
 $profileName = if ($Release) { 'release' } else { 'debug' }
-# cargo metadata 要几百毫秒，只算一次
-$TARGET_DIR = Resolve-TargetDir -CompilerRoot $COMPILER_ROOT
+# cargo metadata 要几百毫秒，上面已经只算过一次
+$TARGET_DIR = Resolve-TargetDir -Meta $cargoMeta -CompilerRoot $COMPILER_ROOT
 $XIYI_EXE   = Join-Path (Join-Path $TARGET_DIR $profileName) 'xiyi.exe'
 if (-not (Test-Path -LiteralPath $XIYI_EXE -PathType Leaf)) {
     Exit-WithError "在 $(Join-Path $TARGET_DIR $profileName) 下找不到 xiyi.exe"
@@ -661,6 +663,19 @@ if ($filtered.Count -eq 0) {
 }
 
 # ============================================================
+# 分片前的"过滤结果指纹"
+#   -Shard 的正确性依赖各机器的过滤结果完全一致。这里对分片前的有序相对路径列表
+#   (每条路径后跟一个 \n) 求 SHA-256，连同用例数写进 JSON 的 FilterCount / FilterDigest：
+#   CI 汇总各分片的报告时，这两项不全相同，就说明各机器看到的 Tests/ 不一致
+#   (浅克隆深度不同、中途有新提交等)，分片可能重叠或漏用例。
+#   四个脚本对同一份用例列表算出的值相同，所以 Linux / macOS / Windows 分片混用也能互相比对。
+#   只覆盖"选中了哪些用例"，不覆盖用例文件内容的改动。
+# ============================================================
+$filterCount  = $filtered.Count
+$filterText   = (@($filtered | ForEach-Object { $_.RelPath }) -join "`n") + "`n"
+$filterDigest = [System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.UTF8Encoding]::new($false).GetBytes($filterText))).ToLowerInvariant()
+
+# ============================================================
 # 分片
 #   $rows 已经按 CompareOrdinal 排好序，与 sh 版的 LC_ALL=C sort 一致；
 #   按位置轮转 (而非按目录切块)，可以把相邻的、通常耗时相近的用例打散，
@@ -679,6 +694,7 @@ if ($shardGiven) {
 }
 
 Write-Host "共 $($filtered.Count) 个测试用例（目录下总计发现 $($testCases.Count) 个）"
+if ($shardGiven) { Write-Host "[shard] 过滤结果指纹: $filterCount 个 / $filterDigest (各分片应完全相同)" -ForegroundColor DarkGray }
 Write-Host ''
 
 # ============================================================
@@ -1064,15 +1080,19 @@ $jsonResults = @(foreach ($r in $results) {
 })
 
 $summary = [pscustomobject][ordered]@{
-    RunId    = $runId
-    Version  = $xiyiVersion
-    Total    = $total
-    Passed   = $passedCount
-    Failed   = $failedCount
-    Timeouts = $timeoutCount
-    Skipped  = $skippedCount
-    Updated  = $updatedCount
-    Results  = $jsonResults
+    RunId        = $runId
+    Version      = $xiyiVersion
+    Total        = $total
+    Passed       = $passedCount
+    Failed       = $failedCount
+    Timeouts     = $timeoutCount
+    Skipped      = $skippedCount
+    Updated      = $updatedCount
+    ShardIndex   = $shardIndex
+    ShardTotal   = $shardTotal
+    FilterCount  = $filterCount
+    FilterDigest = $filterDigest
+    Results      = $jsonResults
 }
 
 $jsonTmp = "$JSON_FILE.tmp.$PID"

@@ -3,7 +3,8 @@
 #
 # 依赖:
 #   bash >= 5.3 (低于此版本直接退出), timeout (GNU coreutils / busybox; macOS 为 gtimeout), cargo
-#   jq  (仅当存在 Tests/list.json 时需要)
+#   jq  (存在 Tests/list.json 或使用 --rerun-failed 时必需；另外用它从 cargo metadata 取版本号，
+#        没有 jq 时版本号显示为 unknown，不影响测试)
 #
 # 平台:
 #   只支持 64 位的 Linux，MacOS 也行。
@@ -413,17 +414,28 @@ rotate_logs log  "$KEEP_LOGS"            # 本次 .log 已创建，含在 KEEP_L
 rotate_logs json "$(( KEEP_LOGS - 1 ))"  # 本次 .json 在最后才写，先给它留一个位置
 
 # ============================================================
-# 版本号：只读 [package] 段，避免误取依赖的 version = "..."
+# cargo metadata：只调用一次，版本号与 target 目录共用
+#   --no-deps 不需要依赖已下载，--offline 避免联网。
+#   比自己解析 Cargo.toml 稳：version.workspace = true、[workspace.package] 继承
+#   这类写法 cargo 会替我们解析好。
 # ============================================================
+CARGO_META=""
+if command -v cargo >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+    CARGO_META="$(cd -- "$COMPILER_ROOT" && cargo metadata --no-deps --format-version 1 --offline 2>/dev/null)" \
+        || CARGO_META=""
+fi
+
+# 取 $COMPILER_ROOT/Cargo.toml 对应那个包的版本；
+# 路径对不上 (如符号链接) 时，只有一个包才采用它，否则宁可显示 unknown 也不猜。
 get_xiyi_version() {
-    local cargo_toml="$COMPILER_ROOT/Cargo.toml" v=""
-    if [[ -f "$cargo_toml" ]]; then
-        v="$(awk '
-            /^[[:space:]]*\[/ { in_pkg = ($0 ~ /^[[:space:]]*\[package\][[:space:]]*(#.*)?\r?$/); next }
-            in_pkg && /^[[:space:]]*version[[:space:]]*=[[:space:]]*"/ {
-                s = $0; sub(/^[^"]*"/, "", s); sub(/".*$/, "", s); print s; exit
-            }
-        ' "$cargo_toml" 2>/dev/null | tr -d '\r')"
+    local v=""
+    if [[ -n "$CARGO_META" ]]; then
+        v="$(jq -r --arg m "$COMPILER_ROOT/Cargo.toml" '
+            .packages
+            | (map(select(.manifest_path == $m)) | first)
+              // (if length == 1 then .[0] else null end)
+            | .version // empty
+        ' <<< "$CARGO_META" 2>/dev/null)" || v=""
     fi
     printf '%s\n' "${v:-unknown}"
 }
@@ -434,9 +446,8 @@ XIYI_VERSION="$(get_xiyi_version)"
 # ============================================================
 resolve_target_dir() {
     local d=""
-    if command -v cargo >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
-        d="$(cd -- "$COMPILER_ROOT" && cargo metadata --no-deps --format-version 1 --offline 2>/dev/null \
-             | jq -r '.target_directory // empty' 2>/dev/null)" || d=""
+    if [[ -n "$CARGO_META" ]]; then
+        d="$(jq -r '.target_directory // empty' <<< "$CARGO_META" 2>/dev/null)" || d=""
     fi
     if [[ -z "$d" ]]; then
         if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
@@ -818,6 +829,32 @@ done
 
 (( ${#FILTERED[@]} > 0 )) || fatal "过滤后没有匹配的测试用例"
 
+# ---- 分片前的"过滤结果指纹" ----
+# --shard 的正确性依赖各机器的过滤结果完全一致。这里对分片前的有序相对路径列表
+# (每条路径后跟一个 \n) 求 SHA-256，连同用例数写进 JSON 的 FilterCount / FilterDigest：
+# CI 汇总各分片的报告时，这两项不全相同，就说明各机器看到的 Tests/ 不一致
+# (浅克隆深度不同、中途有新提交等)，分片可能重叠或漏用例。
+# 四个脚本对同一份用例列表算出的值相同，所以 Linux / macOS / Windows 分片混用也能互相比对。
+# 只覆盖"选中了哪些用例"，不覆盖用例文件内容的改动。
+
+# 对标准输入求 SHA-256 (小写十六进制)；没有可用工具时返回 1。
+sha256_stdin() {
+    local out
+    if   command -v sha256sum >/dev/null 2>&1; then out="$(sha256sum)"
+    elif command -v shasum    >/dev/null 2>&1; then out="$(shasum -a 256)"
+    else return 1
+    fi
+    printf '%s' "${out%% *}"
+}
+
+FILTER_COUNT=${#FILTERED[@]}
+FILTER_DIGEST="$(for _i in "${FILTERED[@]}"; do printf '%s\n' "${T_REL[_i]}"; done | sha256_stdin)" \
+    || FILTER_DIGEST=""
+unset _i
+if (( SHARD_GIVEN == 1 )) && [[ -z "$FILTER_DIGEST" ]]; then
+    warn "找不到 sha256sum / shasum，无法生成分片指纹 (JSON 里的 FilterDigest 留空)"
+fi
+
 # ---- 分片 ----
 # FILTERED 的顺序 = T_REL 的顺序 = 扫描时按 C 区域设置字典序排好的相对路径，
 # 与机器、locale 无关，所以各分片的划分彼此一致。按位置轮转 (而非按目录切块)，
@@ -836,6 +873,7 @@ if (( SHARD_GIVEN == 1 )); then
 fi
 
 echo "共 ${#FILTERED[@]} 个测试用例（目录下总计发现 ${#T_REL[@]} 个）"
+(( SHARD_GIVEN == 1 )) && echo "${C_GRAY}[shard] 过滤结果指纹: $FILTER_COUNT 个 / ${FILTER_DIGEST:-无} (各分片应完全相同)${C_RESET}"
 echo
 
 # ============================================================
@@ -1188,6 +1226,10 @@ json_tmp="$JSON_FILE.tmp.$$"
     printf '  "Timeouts": %d,\n'  "$timeouts"
     printf '  "Skipped": %d,\n'   "$skipped"
     printf '  "Updated": %d,\n'   "$updated"
+    printf '  "ShardIndex": %d,\n'   "$SHARD_INDEX"
+    printf '  "ShardTotal": %d,\n'   "$SHARD_TOTAL"
+    printf '  "FilterCount": %d,\n'  "$FILTER_COUNT"
+    printf '  "FilterDigest": "%s",\n' "$FILTER_DIGEST"
     printf '  "Results": ['
 
     first=1
